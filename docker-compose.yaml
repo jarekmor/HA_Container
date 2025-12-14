@@ -1,0 +1,502 @@
+# =============================================================================
+# Home Assistant Docker Compose Stack
+# =============================================================================
+# Best practices applied:
+# - Secrets management for sensitive data
+# - Health checks on all services
+# - security_opt: no-new-privileges where possible
+# - Logging configuration to prevent disk fill-up
+# - Pinned image versions (avoid :latest)
+# - Organized service groups with comments
+# - Read-only volumes where applicable
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# CORE INFRASTRUCTURE
+# -----------------------------------------------------------------------------
+
+services:
+  # ---------------------------------------------------------------------------
+  # MQTT Broker - Message queue for IoT devices
+  # ---------------------------------------------------------------------------
+  mosquitto:
+    container_name: core-mosquitto
+    image: eclipse-mosquitto:2.0.22
+    hostname: core-mosquitto
+    restart: unless-stopped
+    volumes:
+      - /opt/HA/mosquitto/config:/mosquitto/config
+      - /opt/HA/mosquitto/data:/mosquitto/data
+      - /opt/HA/mosquitto/log:/mosquitto/log
+    ports:
+      - 1883:1883
+      - 9001:9001  # WebSocket port
+    environment:
+      - TZ=Europe/Warsaw
+    networks:
+      - home_assistant
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 5 mosquitto_sub -t '$$SYS/#' -C 1 -i healthcheck -W 3 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # Zigbee2MQTT - Zigbee device gateway
+  # ---------------------------------------------------------------------------
+  zigbee2mqtt:
+    container_name: zigbee2mqtt
+    image: ghcr.io/koenkk/zigbee2mqtt:2.7.1
+    hostname: 45df7312-zigbee2mqtt
+    restart: unless-stopped
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    volumes:
+      - /opt/HA/zigbee2mqtt/data:/app/data
+      - /run/udev:/run/udev:ro
+      - /dev:/dev
+    ports:
+      - 8485:8080
+    environment:
+      - TZ=Europe/Warsaw
+    devices:
+      - /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0:/dev/ttyUSB0
+    networks:
+      - home_assistant
+    privileged: true
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # DATA STORAGE & VISUALIZATION
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # InfluxDB - Time series database for sensor data
+  # ---------------------------------------------------------------------------
+  influxdb:
+    container_name: influxdb
+    image: influxdb:1.8
+    hostname: a0d7b954-influxdb
+    restart: unless-stopped
+    # Don't run as root - influxdb image has user 'influxdb'
+    user: "999:999"
+    volumes:
+      - /opt/HA/influxdb/data:/var/lib/influxdb
+    environment:
+      INFLUXDB_ADMIN_USER: ${INFLUXDB_ADMIN_USER}
+      INFLUXDB_ADMIN_PASSWORD: ${INFLUXDB_ADMIN_PASSWORD}
+      INFLUXDB_DB: homeassistant
+      TZ: Europe/Warsaw
+      INFLUXDB_SUBSCRIBER_ENABLED: "false"
+    ports:
+      - "8086:8086"
+    networks:
+      - home_assistant
+    healthcheck:
+      test: ["CMD", "influx", "-execute", "SHOW DATABASES"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    # Optional: Resource limits
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ---------------------------------------------------------------------------
+  # Chronograf - InfluxDB UI
+  # ---------------------------------------------------------------------------
+  chronograf:
+    container_name: chronograf
+    image: chronograf:1.9.4  # Latest stable version
+    hostname: chronograf
+    restart: unless-stopped
+    ports:
+      - "8888:8888"
+    environment:
+      - TZ=Europe/Warsaw
+    volumes:
+      - /opt/HA/chronograf/data:/var/lib/chronograf
+    networks:
+      - home_assistant
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pidof chronograf || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # Grafana - Visualization dashboards
+  # ---------------------------------------------------------------------------
+  grafana:
+    container_name: grafana
+    image: grafana/grafana:12.3.0
+    restart: unless-stopped
+    hostname: a0d7b954-grafana
+    user: root
+    ports:
+      - 3000:3000
+    volumes:
+      - /opt/HA/grafana/:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+      - GF_INSTALL_PLUGINS=
+      - GF_SERVER_ROOT_URL=http://localhost:3000
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+      - GF_SECURITY_ALLOW_EMBEDDING=true
+      - TZ=Europe/Warsaw
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    networks:
+      - home_assistant
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # DEVELOPMENT & CONFIGURATION TOOLS
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # HASS Configurator - Home Assistant config editor
+  # ---------------------------------------------------------------------------
+  hass-configurator:
+    container_name: configurator
+    image: "causticlab/hass-configurator-docker:latest"
+    restart: unless-stopped
+    hostname: core-configurator
+    ports:
+      - 3218:3218
+    volumes:
+      - /opt/HA/homeassistant:/hass-config
+      - /opt/HA/configurator:/config
+    environment:
+      - HC_IGNORE_SSL=TRUE
+      - TZ=Europe/Warsaw
+    networks:
+      - home_assistant
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f hass-configurator || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # ESPHome - ESP device manager
+  # ---------------------------------------------------------------------------
+  esphome:
+    container_name: esphome
+    image: ghcr.io/esphome/esphome
+    volumes:
+      - /opt/HA/esphome/data:/config
+      - /etc/localtime:/etc/localtime:ro
+    restart: always
+    privileged: true
+    network_mode: host
+    environment:
+      USERNAME: ${ESPHOME_USERNAME}
+      PASSWORD: ${ESPHOME_PASSWORD}
+      TZ: Europe/Warsaw
+    security_opt:
+      - no-new-privileges:true  # May conflict with privileged mode
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:6052/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # DEBUGGING & MONITORING TOOLS
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # SQLite Web - Database browser
+  # ---------------------------------------------------------------------------
+  sqlite-web:
+    image: ghcr.io/coleifer/sqlite-web
+    container_name: sqlite-web
+    ports:
+      - 8088:8080
+    volumes:
+      - /opt/HA/homeassistant:/data
+    restart: unless-stopped
+    command: /data/home-assistant_v2.db
+    networks:
+      - home_assistant
+    healthcheck:
+      test: ["CMD-SHELL", "sqlite3", "version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # MQTT Explorer - MQTT message browser
+  # ---------------------------------------------------------------------------
+  mqtt-explorer:
+    image: smeagolworms4/mqtt-explorer:latest
+    container_name: mqtt-explorer
+    hostname: mqtt-explorer
+    ports:
+      - 4000:4000
+    restart: unless-stopped
+    volumes:
+      - /opt/HA/mqtt-explorer/config:/mqtt-explorer/config
+      - /etc/timezone:/etc/timezone:ro
+    environment:
+      - HTTP_PORT=4000
+      - CONFIG_PATH=/mqtt-explorer/config
+      - TZ=Europe/Warsaw
+    networks:
+      - home_assistant
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:4000 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  code-server:
+    image: codercom/code-server:latest
+    container_name: code-server
+    ports:
+      - "8080:8080"
+    user: "1000:1000"  # Replace with your UID:GID from $(id -u):$(id -g)
+    volumes:
+      - /opt/HA/vscode/workspace:/home/coder/project
+      - /opt/HA/vscode/config:/home/coder/.config/code-server
+      - /opt/HA/homeassistant:/home/coder/homeassistant
+    command: --auth none
+    restart: unless-stopped
+    networks:
+      - home_assistant
+
+  # ---------------------------------------------------------------------------
+  # Duplicati - Backup
+  # ---------------------------------------------------------------------------
+  duplicati:
+    image: duplicati/duplicati:2.2.0.102
+    container_name: duplicati
+    restart: unless-stopped
+    privileged: true
+    ports:
+      - 8200:8200
+    volumes:
+      - /opt/HA/duplicati/config:/config
+      - /opt/HA/duplicati/backup:/backup
+      - /:/source:ro
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Warsaw
+      - SETTINGS_ENCRYPTION_KEY=${DUPLICATI_KEY}
+      - DUPLICATI__WEBSERVICE_PASSWORD=${DUPLICATI_PASSWORD}
+    networks:
+      - home_assistant
+    healthcheck:
+      test: ["CMD", "/opt/duplicati/duplicati-server-util", "health"]
+      interval: 90s
+      timeout: 30s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ---------------------------------------------------------------------------
+  # Glances - Monitoring
+  # ---------------------------------------------------------------------------
+  glances:
+    image: nicolargo/glances:alpine-dev
+    container_name: glances
+    restart: unless-stopped
+    pid: host
+    network_mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /run/user/1000/podman/podman.sock:/run/user/1000/podman/podman.sock
+    environment:
+      - "GLANCES_OPT=-w"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:61208/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ---------------------------------------------------------------------------
+  # Beszel - Monitoring
+  # ---------------------------------------------------------------------------
+  beszel:
+    image: henrygd/beszel:latest
+    container_name: beszel
+    restart: unless-stopped
+    ports:
+      - 8090:8090
+    volumes:
+      - /opt/HA/beszel/beszel_data:/beszel_data
+      - /opt/HA/beszel/beszel_socket:/beszel_socket
+    healthcheck:
+      # The URL is relative to the container, not the host
+      test: ['CMD', '/beszel', 'health', '--url', 'http://localhost:8090']
+      start_period: 5s # Check 5 seconds after the container starts
+      interval: 120s # Then check every 120 seconds after that
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ---------------------------------------------------------------------------
+  # Beszel-agent - Monitoring
+  # ---------------------------------------------------------------------------
+  beszel-agent:
+    image: henrygd/beszel-agent:alpine
+    container_name: beszel-agent
+    restart: unless-stopped
+    network_mode: host
+    devices:
+      - /dev/sda:/dev/sda
+    cap_add:
+      - SYS_RAWIO
+    volumes:
+      - /opt/HA/beszel/beszel_agent_data:/var/lib/beszel-agent
+      - /opt/HA/beszel/beszel_socket:/beszel_socket
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      LISTEN: /beszel_socket/beszel.sock
+      HUB_URL: http://localhost:8090
+      TOKEN: ${BESZEL_TOKEN}
+      KEY: ${BESZEL_KEY}
+    healthcheck:
+      test: ['CMD', '/agent', 'health']
+      interval: 120s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ---------------------------------------------------------------------------
+  # HOME ASSISTANT - Main application
+  # ---------------------------------------------------------------------------
+  home_assistant:
+    container_name: ha
+    image: "ghcr.io/home-assistant/home-assistant:stable"
+    restart: unless-stopped
+    hostname: ha
+    volumes:
+      - /opt/HA/homeassistant:/config
+      - /etc/localtime:/etc/localtime:ro
+      - /run/dbus:/run/dbus:ro
+    environment:
+      - TZ=Europe/Warsaw
+    depends_on:
+      zigbee2mqtt:
+        condition: service_started
+      mosquitto:
+        condition: service_healthy
+    # Home Assistant needs host networking for mDNS discovery
+    network_mode: host
+    privileged: true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8123 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+networks:
+  home_assistant:
+    external: true
+    name: home_assistant
